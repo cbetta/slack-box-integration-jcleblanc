@@ -1,23 +1,21 @@
-const boxSDK = require("box-node-sdk");
-const config = require("./config.js");
+const box = require("box-node-sdk");
+
+const slackConfig = require("./slackConfig.json");
+const boxConfig = require("./boxConfig.json");
+
 const express = require("express");
 const app = express();
 const axios = require("axios");
-const path = require("path");
 const util = require("util");
-const fs = require("fs");
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-const configJSON = JSON.parse(
-  fs.readFileSync(path.resolve(__dirname, "./config.json"))
-);
-const sdk = boxSDK.getPreconfiguredInstance(configJSON);
+const sdk = box.getPreconfiguredInstance(boxConfig);
 const client = sdk.getAppAuthClient("enterprise");
 
 app.post("/event", (req, res) => {
-  if (req.body.token !== config.verificationToken) {
+  if (req.body.token !== slackConfig.verificationToken) {
     res.send("Slack Verification Failed");
   }
 
@@ -26,12 +24,10 @@ app.post("/event", (req, res) => {
 
 const handler = (() => {
   function process(res, data) {
-    let userId;
-
-    if (data.type && data.type === "event_callback") {
+    if (data.type && data.type === "eventcallback") {
       const eventType = data.event.type;
       const channel = data.event.channel;
-      userId = data.event.user;
+      const userId = data.event.user;
 
       getSlackUser(userId, function (user) {
         processUser(user, eventType, channel);
@@ -39,15 +35,12 @@ const handler = (() => {
 
       res.send();
     } else if (data.command && data.command === "/boxadd") {
-      textOptions = data.text.split(" ");
-      if (
-        ["file", "folder"].indexOf(textOptions[0]) >= 0 &&
-        isNaN(textOptions[1]) === false
-      ) {
-        userId = data.user_id;
+      const [itemType, itemId] = data.text.split(" ");
+      if (["file", "folder"].includes(itemType) && !isNaN(itemId)) {
+        const userId = data.user_id;
 
         getSlackUser(userId, function (user) {
-          processContent(user, data.channel_id, textOptions[0], textOptions[1]);
+          processContent(user, data.channel_id, itemType, itemId);
         });
         res.send("Adding content");
       } else {
@@ -59,22 +52,22 @@ const handler = (() => {
   }
 
   function processUser(user, event, channel) {
-    getGroupId(channel, function (gid) {
+    getGroupId(channel, function (groupId) {
       // if bot was added, add all channel users
-      if (user.is_bot === true) {
-        processSlackChannel(channel, gid);
+      if (user.is_bot) {
+        processSlackChannel(channel, groupId);
       } else if (
         user.profile &&
         user.profile.email &&
         event === "member_joined_channel"
       ) {
-        addGroupUser(gid, user.profile.email);
+        addGroupUser(groupId, user.profile.email);
       } else if (
         user.profile &&
         user.profile.email &&
         event === "member_left_channel"
       ) {
-        removeGroupUser(gid, user.profile.email);
+        removeGroupUser(groupId, user.profile.email);
       }
     });
   }
@@ -127,18 +120,18 @@ const handler = (() => {
     });
   }
 
-  function processContent(user, channel, type, fid) {
-    getGroupId(channel, function (gid) {
+  function processContent(user, channel, itemType, itemId) {
+    getGroupId(channel, function (groupId) {
       const email = user.profile.email;
 
       client.enterprise.getUsers({ filter_term: email }).then((users) => {
         if (users.entries.length > 0) {
           client.asUser(users.entries[0].id);
           const collabRole = client.collaborationRoles.VIEWER;
-          const collabOptions = { type: type };
+          const collabOptions = { type: itemType };
 
           client.collaborations
-            .createWithGroupID(gid, fid, collabRole, collabOptions)
+            .createWithGroupID(groupId, itemId, collabRole, collabOptions)
             .then((collaboration) => {
               console.log(
                 `Content added with collaboration ID ${collaboration.id}`
@@ -157,57 +150,48 @@ const handler = (() => {
     });
   }
 
-  function processSlackChannel(channel, gid) {
+  function processSlackChannel(channel, groupId) {
     const limit = 100;
-    const channelUsersPath = `https://slack.com/api/conversations.members?token=${config.botToken}&channel=${channel}&limit=${limit}`;
-    let userPath = "";
+    const channelUsersPath = `https://slack.com/api/conversations.members?token=${slackConfig.botToken}&channel=${channel}&limit=${limit}`;
 
     axios.get(channelUsersPath).then((response) => {
       response.data.members.forEach((uid) => {
         getSlackUser(uid, function (user) {
-          if (user.profile.email && user.is_bot === false) {
-            addGroupUser(gid, user.profile.email);
+          if (user.profile.email && !user.is_bot) {
+            addGroupUser(groupId, user.profile.email);
           }
         });
       });
     });
   }
 
-  function getSlackUser(userId, _callback) {
-    const userPath = `https://slack.com/api/users.info?token=${config.botToken}&user=${userId}`;
+  function getSlackUser(userId, callback) {
+    const userPath = `https://slack.com/api/users.info?token=${slackConfig.botToken}&user=${userId}`;
 
     axios.get(userPath).then((response) => {
       if (response.data.user && response.data.user.profile) {
-        _callback(response.data.user);
+        callback(response.data.user);
       } else {
         console.log("No user data found");
       }
     });
   }
 
-  function getGroupId(groupName, _callback) {
-    let groupId = 0;
-
+  function getGroupId(groupName, callback) {
     client.groups.getAll().then((groups) => {
-      for (let i = 0; i < groups.entries.length; i++) {
-        if (groups.entries[i].name === groupName) {
-          groupId = groups.entries[i].id;
-          break;
-        }
-      }
+      const group = groups.entries.filter((g) => g.name === groupName)[0];
 
-      if (groupId === 0) {
+      if (!group) {
         client.groups
           .create(groupName, {
             description: "Slack channel collaboration group",
             invitability_level: "all_managed_users",
           })
           .then((group) => {
-            groupId = group.id;
-            _callback(groupId);
+            callback(group.id);
           });
       } else {
-        _callback(groupId);
+        callback(group.id);
       }
     });
   }
@@ -218,6 +202,6 @@ const handler = (() => {
 })();
 
 const port = process.env.PORT || 3000;
-app.listen(port, function (err) {
+app.listen(port, () => {
   console.log("Server listening on PORT", port);
 });
